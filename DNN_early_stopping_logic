@@ -1,0 +1,361 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import optuna
+ 
+# Define the directory for results
+base_output_dir = "path_to_output_directory"
+data_dir =  "path_to_file"
+ 
+# Define columns
+columns = ['TOTEXTTAU', 'BCEXTTAU', 'BCSCATAU', 'DUEXTTAU', 'DUSCATAU',
+           'OCEXTTAU', 'OCSCATAU', 'SSEXTTAU', 'SUEXTTAU', 'TOTANGSTR',
+           'SSSCATAU']
+columns_to_include=['TOTEXTTAU', 'BCEXTTAU', 'BCSCATAU', 'DUEXTTAU', 'DUSCATAU',
+           'OCEXTTAU', 'OCSCATAU', 'SSEXTTAU', 'SUEXTTAU', 'TOTANGSTR',
+           'SSSCATAU', 'AOD550_AVG']
+ 
+# Custom Dataset class
+class TimeSeriesDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = X
+        self.y = y
+ 
+    def __len__(self):
+        return len(self.X)
+ 
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+ 
+# Define the improved DNN model with flexible activation function
+class ImprovedDNN(nn.Module):
+    def __init__(self, input_size, activation_func, droprate=0.2):
+        super(ImprovedDNN, self).__init__()
+        self.activation_func = activation_func
+        self.layers = nn.Sequential(
+            nn.Linear(input_size, 512),
+            self.get_activation_function(),
+            nn.Dropout(droprate),
+            nn.Linear(512, 256),
+            self.get_activation_function(),
+            nn.Dropout(droprate),
+            nn.Linear(256, 128),
+            self.get_activation_function(),
+            nn.Dropout(droprate),
+            nn.Linear(128, 1)  # Output layer
+        )
+ 
+    def get_activation_function(self):
+        if self.activation_func == "ReLU":
+            return nn.ReLU()
+        elif self.activation_func == "LeakyReLU":
+            return nn.LeakyReLU(0.01)
+        elif self.activation_func == "Sigmoid":
+            return nn.Sigmoid()
+        elif self.activation_func == "Tanh":
+            return nn.Tanh()
+        else:
+            return nn.ReLU()  # Default to ReLU
+ 
+    def forward(self, x):
+        return self.layers(x)
+ 
+# Define the objective function for Optuna with activation function selection
+def objective(trial, file_path):
+    num_epochs = trial.suggest_int("num_epochs", 50, 300, step=50)
+    droprate = trial.suggest_float("droprate", 0.0001, 0.002)
+    batch_size = trial.suggest_int("batch_size", 16, 64, step=16)
+    activation_func = trial.suggest_categorical("activation_func", ["ReLU", "LeakyReLU", "Sigmoid", "Tanh"])
+ 
+    # Load and process data
+    data = pd.read_csv(file_path)
+    data=data[columns_to_include]
+    data = data.replace(-999, np.nan).dropna()
+    X = data[columns].values
+    y = data['AOD550_AVG'].values
+ 
+    # Check if there are enough samples
+    if len(X) < 2:
+        print(f"Warning: Not enough data in file {file_path} for training.")
+        return float('inf')  # Return high loss to indicate failure
+ 
+    # Split data into train, validation, and test sets (70% train, 15% validation, 15% test)
+    X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.3, random_state=42)
+    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+ 
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_val = scaler.transform(X_val)
+    X_test = scaler.transform(X_test)
+ 
+    # Convert data to tensors
+    X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+    y_train_tensor = torch.tensor(y_train, dtype=torch.float32).view(-1, 1)
+    X_val_tensor = torch.tensor(X_val, dtype=torch.float32)
+    y_val_tensor = torch.tensor(y_val, dtype=torch.float32).view(-1, 1)
+    X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+    y_test_tensor = torch.tensor(y_test, dtype=torch.float32).view(-1, 1)
+ 
+    train_dataset = TimeSeriesDataset(X_train_tensor, y_train_tensor)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+ 
+    model = ImprovedDNN(input_size=X_train.shape[1], activation_func=activation_func, droprate=droprate)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.1)
+ 
+    best_loss = float('inf')
+    patience = 10  # Number of epochs to wait before stopping
+    trigger_times = 0
+    train_losses = []
+    val_losses = []
+    test_losses = []  # Track test loss
+ 
+    for epoch in range(num_epochs):
+        model.train()
+        epoch_loss = 0
+        for inputs, targets in train_loader:
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+ 
+        avg_loss = epoch_loss / len(train_loader)
+        train_losses.append(avg_loss)
+ 
+        # Validation loss
+        model.eval()
+        with torch.no_grad():
+            val_outputs = model(X_val_tensor)
+            val_loss = criterion(val_outputs, y_val_tensor)
+            val_losses.append(val_loss.item())
+ 
+            # Test loss
+            test_outputs = model(X_test_tensor)
+            test_loss = criterion(test_outputs, y_test_tensor).item()
+            test_losses.append(test_loss)
+ 
+        print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {avg_loss:.4f}, Val Loss: {val_loss.item():.4f}, Test Loss: {test_loss:.4f}")
+ 
+        # Early stopping logic
+        if val_loss < best_loss:
+            best_loss = val_loss
+            trigger_times = 0
+            torch.save(model.state_dict(), os.path.join(file_output_dir, 'best_model_final.pth'))
+        else:
+            trigger_times += 1
+            if trigger_times >= patience:
+                print("Early stopping triggered")
+                break
+ 
+        # Step the scheduler
+        scheduler.step()
+ 
+    return best_loss  # Return the best loss for Optuna optimization
+ 
+# Process each file in the directory
+for file_name in os.listdir(data_dir):
+    if file_name.endswith('.csv'):
+        file_path = os.path.join(data_dir, file_name)
+ 
+        # Create a directory for results based on the file name
+        file_output_dir = os.path.join(base_output_dir, os.path.splitext(file_name)[0])
+        if os.path.exists(file_output_dir):
+            print(f"Model has already been run for {file_name}. Skipping to the next file.")
+            continue  # Skip to the next file if output directory exists
+        
+        os.makedirs(file_output_dir, exist_ok=True)
+ 
+        # Create study for hyperparameter optimization
+        study = optuna.create_study(direction="minimize")
+        study.optimize(lambda trial: objective(trial, file_path), n_trials=50)
+ 
+        # Best parameters
+        best_params = study.best_params
+        print("Best hyperparameters: ", best_params)
+ 
+        # Load and process data again for final training
+        data = pd.read_csv(file_path)
+        data=data[columns_to_include]
+        data = data.replace(-999, np.nan).dropna()
+        X = data[columns].values
+        y = data['AOD550_AVG'].values
+ 
+        # Check if there are enough samples
+        if len(X) < 2:
+            print(f"Warning: Not enough data in file {file_name} for training.")
+            continue  # Skip to the next file
+ 
+        # Split data into train, validation, and test sets (70% train, 15% validation, 15% test)
+        X_train, X_temp, y_train, y_temp = train_test_split(X, y, test_size=0.3, random_state=42)
+        X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+ 
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X_train)
+        X_val = scaler.transform(X_val)
+        X_test = scaler.transform(X_test)
+ 
+        # Convert data to tensors
+        X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+        y_train_tensor = torch.tensor(y_train, dtype=torch.float32).view(-1, 1)
+        X_val_tensor = torch.tensor(X_val, dtype=torch.float32)
+        y_val_tensor = torch.tensor(y_val, dtype=torch.float32).view(-1, 1)
+        X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+        y_test_tensor = torch.tensor(y_test, dtype=torch.float32).view(-1, 1)
+ 
+        # Create DataLoader
+        train_dataset = TimeSeriesDataset(X_train_tensor, y_train_tensor)
+        train_loader = DataLoader(train_dataset, batch_size=best_params['batch_size'], shuffle=True)
+ 
+        # Instantiate and train the model with best parameters
+        model = ImprovedDNN(input_size=X_train.shape[1], activation_func=best_params['activation_func'], droprate=best_params['droprate'])
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.1)
+ 
+        # Training loop
+        train_losses = []
+        val_losses = []
+        test_losses = []  # Add test loss tracking
+        best_loss = float('inf')
+        patience = 10
+        trigger_times = 0
+ 
+        for epoch in range(best_params['num_epochs']):
+            model.train()
+            epoch_loss = 0
+            for inputs, targets in train_loader:
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+            avg_loss = epoch_loss / len(train_loader)
+            train_losses.append(avg_loss)
+ 
+            # Calculate validation loss
+            model.eval()
+            with torch.no_grad():
+                val_outputs = model(X_val_tensor)
+                val_loss = criterion(val_outputs, y_val_tensor)
+                val_losses.append(val_loss.item())
+ 
+                # Calculate testing loss
+                test_outputs = model(X_test_tensor)
+                test_loss = criterion(test_outputs, y_test_tensor).item()
+                test_losses.append(test_loss)
+ 
+            print(f"Epoch {epoch + 1}/{best_params['num_epochs']}, Train Loss: {avg_loss:.4f}, Val Loss: {val_loss.item():.4f}, Test Loss: {test_loss:.4f}")
+ 
+            # Early stopping logic
+            if val_loss < best_loss:
+                best_loss = val_loss
+                trigger_times = 0
+                torch.save(model.state_dict(), os.path.join(file_output_dir, 'best_model_final.pth'))
+            else:
+                trigger_times += 1
+                if trigger_times >= patience:
+                    print("Early stopping triggered")
+                    break
+ 
+            # Step the scheduler
+            scheduler.step()
+ 
+        # Plot training, validation, and testing loss
+        def plot_best_fit_line(x, y, label):
+
+            """
+            Draws a scatter plot of the data points and adds a best fit line.
+            """
+            # Scatter plot
+            plt.scatter(x, y, label=f'{label} Predictions', alpha=0.5)
+
+            # Calculate the best fit line (linear regression)
+            slope, intercept = np.polyfit(x, y, 1)  # 1 means linear fit
+            best_fit_line = slope * np.array(x) + intercept
+            # Plot the best fit line in red
+            plt.plot(x, best_fit_line, color='red', label=f'{label} Best Fit Line')
+
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(train_losses, label='Training Loss')
+        plt.plot(val_losses, label='Validation Loss')
+        plt.plot(test_losses, label='Testing Loss')  # Add testing loss to the plot
+        plt.title("Training, Validation, and Testing Loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.legend()
+        plt.grid()
+        plt.savefig(os.path.join(file_output_dir, 'loss_plot_with_test_loss.png'))
+        plt.close()
+ 
+        # Scatter plot for Predicted vs True values (Validation Set)
+        model.eval()
+        with torch.no_grad():
+            y_val_pred = model(X_val_tensor).numpy().flatten()
+ 
+        # Calculate metrics for the validation set
+        mse_val = mean_squared_error(y_val, y_val_pred)
+        rmse_val = np.sqrt(mse_val)
+        mae_val = mean_absolute_error(y_val, y_val_pred)
+        r2_val = r2_score(y_val, y_val_pred)
+ 
+        # Plot scatter plot of Predicted vs True values (Validation Set)
+        plt.figure(figsize=(8, 6))
+        plot_best_fit_line(y_val, y_val_pred, 'Validation')
+        #plt.scatter(y_val, y_val_pred, c='blue', label='Predictions', alpha=0.5)
+        plt.plot([min(y_val), max(y_val)], [min(y_val), max(y_val)], color='green', linestyle='--', label='1:1 Line')
+        plt.xlabel('True Values (AOD550_AVG)')
+        plt.ylabel('Predicted Values (AOD550_AVG)')
+        plt.title(f'Scatter Plot: Predicted vs True Values - {file_name} (Validation Set)')
+ 
+        # Add text with performance metrics
+        metrics_text_val = f"MSE: {mse_val:.4f}\nRMSE: {rmse_val:.4f}\nMAE: {mae_val:.4f}\nR²: {r2_val:.4f}"
+        plt.text(0.95, 0.05, metrics_text_val, transform=plt.gca().transAxes, fontsize=10, verticalalignment='bottom', horizontalalignment='right', bbox=dict(facecolor='wheat', alpha=0.5))
+ 
+        plt.legend(loc='upper left')
+        plt.grid()
+        plt.savefig(os.path.join(file_output_dir, 'scatter_plot_pred_vs_true_val_set.png'))
+        plt.close()
+ 
+        # Scatter plot for Predicted vs True values (Test Set)
+        with torch.no_grad():
+            y_test_pred = model(X_test_tensor).numpy().flatten()
+ 
+        # Calculate metrics for the test set
+        mse_test = mean_squared_error(y_test, y_test_pred)
+        rmse_test = np.sqrt(mse_test)
+        mae_test = mean_absolute_error(y_test, y_test_pred)
+        r2_test = r2_score(y_test, y_test_pred)
+ 
+        # Plot scatter plot of Predicted vs True values (Test Set)
+        plt.figure(figsize=(8, 6))
+        #plt.scatter(y_test, y_test_pred, c='blue', label='Predictions', alpha=0.5)
+        plot_best_fit_line(y_test, y_test_pred, 'Test') 
+        plt.plot([min(y_test), max(y_test)], [min(y_test), max(y_test)], color='green', linestyle='--', label='1:1 Line')
+        plt.xlabel('True Values (AOD550_AVG)')
+        plt.ylabel('Predicted Values (AOD550_AVG)')
+        plt.title(f'Scatter Plot: Predicted vs True Values - {file_name} (Test Set)')
+ 
+        # Add text with performance metrics
+        metrics_text_test = f"MSE: {mse_test:.4f}\nRMSE: {rmse_test:.4f}\nMAE: {mae_test:.4f}\nR²: {r2_test:.4f}"
+        plt.text(0.95, 0.05, metrics_text_test, transform=plt.gca().transAxes, fontsize=10, verticalalignment='bottom', horizontalalignment='right', bbox=dict(facecolor='wheat', alpha=0.5))
+ 
+        plt.legend(loc='upper left')
+        plt.grid()
+        plt.savefig(os.path.join(file_output_dir, 'scatter_plot_pred_vs_true_test_set.png'))
+        plt.close()
+ 
+        # Save the predicted values vs true values in a CSV for test set
+        predicted_df = pd.DataFrame({'True Values': y_test, 'Predictions': y_test_pred})
+        predicted_df.to_csv(os.path.join(file_output_dir, 'predicted_values_vs_true_test_set.csv'), index=False)
